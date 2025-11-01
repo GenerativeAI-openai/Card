@@ -225,12 +225,24 @@ const $ex2 = document.getElementById("ex2");
 const $format = document.getElementById("format");
 const $clear = document.getElementById("clear");
 
-$ex1.onclick = () => { $q.value = ex1; };
-$ex2.onclick = () => { $q.value = ex2; };
-$format.onclick = () => { $q.value = ($q.value ? ($q.value + "\\n\\n") : "") + FORMAT_HINT; };
-$clear.onclick = () => { $q.value = ""; $out.textContent = ""; };
+$ex1.addEventListener("click", () => {
+  $q.value = ex1;
+});
 
-$ask.onclick = async () => {
+$ex2.addEventListener("click", () => {
+  $q.value = ex2;
+});
+
+$format.addEventListener("click", () => {
+  $q.value = ($q.value ? ($q.value + "\n\n") : "") + FORMAT_HINT;
+});
+
+$clear.addEventListener("click", () => {
+  $q.value = "";
+  $out.textContent = "";
+});
+
+$ask.addEventListener("click", async () => {
   const userText = ($q.value || "").trim();
   if (!userText) { alert("질문을 입력해 주세요."); return; }
   $spin.classList.add("on");
