@@ -2,90 +2,115 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>영단어 자동 추출기 - 고정확도</title>
+<title>영단어 OCR 통합 방식</title>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
 <style>
 body { font-family: sans-serif; padding:20px; }
-.word { font-weight:bold; color:#003399; margin-top:8px; }
-.mean { color:#555; margin-bottom:12px; }
+.word { font-weight:bold; color:#003399; margin-top:8px; font-size:18px; }
+.mean { color:#444; margin-bottom:12px; font-size:15px; }
 </style>
 </head>
 <body>
 
-<h2>📚 영어 단어 OCR 추출기</h2>
+<h2>📚 영어 단어 OCR 자동추출 (좌표+텍스트 방식 통합)</h2>
 <input type="file" id="file" accept="image/*"><br><br>
-<button onclick="start()">추출 시작</button>
+<button onclick="run()">추출</button>
 <div id="log"></div>
 <div id="output"></div>
 <button id="saveBtn" style="display:none">CSV 저장</button>
 
 <script>
-function koreanRatio(s){const m=s.match(/[가-힣]/g);return m?m.length/s.length:0;}
-function isEnglishWord(s){
-  return /^[A-Za-z][A-Za-z\-]{2,18}$/.test(s) && !s.match(/[0-9]/);
-}
+// 한국어 비율
+function korRatio(s){const m=s.match(/[가-힣]/g);return m?m.length/s.length:0;}
+// 영어 단어 판단
+function isWord(s){return /^[A-Za-z][A-Za-z\-]{2,18}$/.test(s);}
 
-async function start(){
+async function run(){
   const file=document.getElementById("file").files[0];
-  if(!file){alert("이미지 선택!"); return;}
+  if(!file){ alert("이미지 선택하세요"); return; }
 
-  document.getElementById("log").innerText="⏳ OCR 분석 중...";
+  document.getElementById("log").innerText="⏳ 분석 중...";
 
   const {data:{words}} = await Tesseract.recognize(file,"eng+kor",{
     logger:m=>{if(m.status)document.getElementById("log").innerText=m.status;}
   });
 
-  // 박스 기반 정렬
-  let boxes=words.map(w=>({
-    text:w.text.trim(),
-    x:w.bbox.x0, y:w.bbox.y0, h:w.bbox.y1-w.bbox.y0
-  })).filter(w=>w.text);
+  // OCR 박스 정리
+  let boxes = words.map(w=>({
+    text: w.text.trim(),
+    x: w.bbox.x0, y: w.bbox.y0,
+    h: w.bbox.y1 - w.bbox.y0
+  })).filter(b=>b.text);
 
-  // 평균 글자 높이
-  const meanH = boxes.reduce((s,b)=>s+b.h,0)/boxes.length;
+  const avgH = boxes.reduce((s,b)=>s+b.h,0)/boxes.length;
 
-  // 헤드워드 후보 = 큰 글씨 + 영어 단어
-  let heads = boxes.filter(b=>b.h>meanH*1.2 && isEnglishWord(b.text));
+  // Step1) 왼쪽에 크고 영어 = 헤드워드 후보
+  let heads = boxes.filter(b=>b.h > avgH*1.2 && isWord(b.text) && b.x < 500);
 
-  let results=[];
+  let results = [];
+
   for(let hw of heads){
-    // 바로 아래 줄들 탐색
-    let near=boxes.filter(b=>b.y>hw.y && b.y<hw.y+meanH*8);
+    // Step2) 텍스트 줄 기준도 동시에 수행 → 통합 점수 계산
+    let near = boxes.filter(b => b.y > hw.y && b.y < hw.y + avgH*10);
 
-    // 한국어 비율 높은 줄
-    let candidates=near.filter(b=>koreanRatio(b.text)>0.4);
+    let best = null, bestScore = 0;
 
-    if(candidates.length>0){
-      // 가장 위쪽 한 줄 선택
-      let mean = candidates.sort((a,b)=>a.y-b.y)[0].text;
-      results.push({word:hw.text.toLowerCase(), meaning:mean});
+    for(let cand of near){
+      const text = cand.text;
+
+      // 의미 조건
+      const isKoreanMeaning = korRatio(text) > 0.3 && !/[A-Za-z]{3,}/.test(text);
+
+      if(!isKoreanMeaning) continue;
+
+      // 거리 점수(가까울수록 높음)
+      const dy = cand.y - hw.y;
+      const distScore = Math.max(0, (300 - dy)) / 300;
+
+      // 텍스트 의미 점수
+      const textScore = korRatio(text);
+
+      // 총 점수: 거리 + 한국어 비율
+      const score = distScore*0.5 + textScore*0.5;
+
+      if(score > bestScore){
+        bestScore = score;
+        best = cand;
+      }
+    }
+
+    if(best){
+      results.push({
+        word: hw.text.toLowerCase(),
+        meaning: best.text.replace(/^(\d+\.|\·|\-)\s*/,"")
+      });
     }
   }
 
   // 중복 제거
-  const final = Array.from(new Map(results.map(v=>[v.word,v])).values());
+  const uniq = Array.from(new Map(results.map(v=>[v.word,v])).values());
 
   // 출력
-  let html="";
-  final.forEach(v=>{
-    html+=`<div class="word">${v.word}</div><div class="mean">${v.meaning}</div>`;
+  let out="";
+  uniq.forEach(v=>{
+    out+=`<div class="word">${v.word}</div><div class="mean">${v.meaning}</div>`;
   });
 
-  document.getElementById("output").innerHTML = html || "❌ 단어를 찾지 못했습니다.";
-  document.getElementById("log").innerText="✅ 완료!";
+  document.getElementById("output").innerHTML = out || "❌ 단어 없음";
+  document.getElementById("log").innerText="✅ 완료";
 
-  if(final.length>0){
+  if(uniq.length>0){
     const btn=document.getElementById("saveBtn");
     btn.style.display="inline-block";
-    btn.onclick=()=>{
+    btn.onclick = ()=>{
       let csv="word,meaning\n";
-      final.forEach(v=>csv+=`${v.word},"${v.meaning}"\n`);
+      uniq.forEach(v=>csv+=`${v.word},"${v.meaning}"\n`);
       const blob=new Blob([csv],{type:"text/csv"});
       const a=document.createElement("a");
       a.href=URL.createObjectURL(blob);
       a.download="vocab.csv";
       a.click();
-    }
+    };
   }
 }
 </script>
