@@ -1,119 +1,228 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-<meta charset="UTF-8">
-<title>영단어 OCR 통합 방식</title>
+<meta charset="UTF-8" />
+<title>영단어 OCR (발음 제외 · 라인정확도 향상)</title>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
 <style>
-body { font-family: sans-serif; padding:20px; }
-.word { font-weight:bold; color:#003399; margin-top:8px; font-size:18px; }
-.mean { color:#444; margin-bottom:12px; font-size:15px; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; line-height: 1.5; }
+  h2 { margin: 0 0 12px; }
+  .row { margin: 10px 0; }
+  #status { margin: 8px 0 16px; }
+  .word { font-weight: 800; color: #003a8c; margin-top: 12px; font-size: 18px; }
+  .mean { color: #333; margin-bottom: 10px; font-size: 15px; }
+  .hint { color: #666; font-size: 13px; }
+  button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: #fff; cursor: pointer; }
+  button:hover { background: #f6f6f6; }
 </style>
 </head>
 <body>
 
-<h2>📚 영어 단어 OCR 자동추출 (좌표+텍스트 방식 통합)</h2>
-<input type="file" id="file" accept="image/*"><br><br>
-<button onclick="run()">추출</button>
-<div id="log"></div>
+<h2>📚 영어 단어 OCR (발음 제외 & 위치+텍스트 통합)</h2>
+<div class="row">
+  <input type="file" id="file" accept="image/*" />
+  <button id="runBtn">추출</button>
+  <button id="saveBtn" style="display:none">CSV 저장</button>
+</div>
+<div id="status" class="hint">사진은 정면/밝게/페이지만 나오게 찍을수록 정확합니다.</div>
 <div id="output"></div>
-<button id="saveBtn" style="display:none">CSV 저장</button>
 
 <script>
-// 한국어 비율
-function korRatio(s){const m=s.match(/[가-힣]/g);return m?m.length/s.length:0;}
-// 영어 단어 판단
-function isWord(s){return /^[A-Za-z][A-Za-z\-]{2,18}$/.test(s);}
-
-async function run(){
-  const file=document.getElementById("file").files[0];
-  if(!file){ alert("이미지 선택하세요"); return; }
-
-  document.getElementById("log").innerText="⏳ 분석 중...";
-
-  const {data:{words}} = await Tesseract.recognize(file,"eng+kor",{
-    logger:m=>{if(m.status)document.getElementById("log").innerText=m.status;}
+/* ===================== 전처리: 이미지 → 캔버스 업스케일/컨트라스트 ===================== */
+async function fileToCanvas(file, targetLong=2200){
+  const img = await new Promise((res)=>{
+    const i = new Image();
+    i.onload = ()=>res(i);
+    i.src = URL.createObjectURL(file);
   });
 
-  // OCR 박스 정리
-  let boxes = words.map(w=>({
-    text: w.text.trim(),
-    x: w.bbox.x0, y: w.bbox.y0,
-    h: w.bbox.y1 - w.bbox.y0
-  })).filter(b=>b.text);
+  const longSide = Math.max(img.width, img.height);
+  const scale = longSide < targetLong ? (targetLong / longSide) : 1;
 
-  const avgH = boxes.reduce((s,b)=>s+b.h,0)/boxes.length;
+  const w = Math.round(img.width * scale);
+  const h = Math.round(img.height * scale);
 
-  // Step1) 왼쪽에 크고 영어 = 헤드워드 후보
-  let heads = boxes.filter(b=>b.h > avgH*1.2 && isWord(b.text) && b.x < 500);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
 
-  let results = [];
+  // 캔버스 필터로 기본 보정 (브라우저 지원)
+  ctx.filter = 'contrast(130%) brightness(110%)';
+  ctx.drawImage(img, 0, 0, w, h);
 
-  for(let hw of heads){
-    // Step2) 텍스트 줄 기준도 동시에 수행 → 통합 점수 계산
-    let near = boxes.filter(b => b.y > hw.y && b.y < hw.y + avgH*10);
+  return c;
+}
 
-    let best = null, bestScore = 0;
+/* ===================== 휴리스틱 ===================== */
+function koreanRatio(s){ const m = s.match(/[가-힣]/g); return m ? m.length / s.length : 0; }
+function isEnglishWord(s){
+  // 줄에서 첫 토큰만 보고 판단 (headword는 보통 첫 단어)
+  const w = (s||'').trim().split(/[\s·—–-]/)[0]; // 음절점/대시로 끊김 방지
+  return /^[A-Za-z][A-Za-z\-]{2,18}$/.test(w) && !/[0-9]/.test(w);
+}
+function firstToken(s){ return (s||'').trim().split(/\s+/)[0] || ''; }
 
-    for(let cand of near){
-      const text = cand.text;
+function looksLikePronunciation(lineText){
+  // IPA/발음: /.../ 또는 [...] 포함, IPA 표기문자 다수, 음절점(·/‧) 반복 등
+  const t = (lineText||'').trim();
+  if (!t) return false;
+  if (/\/[^\/]+\/|\[[^\]]+\]/.test(t)) return true; // /.../ or [...]
+  if (/[ˈˌɪɐæʊəɛɜʒθðɔɒɑːˑ͡ɡ]/.test(t)) return true; // IPA문자
+  if (t.includes('·') || t.includes('‧')) {
+    // el·ab·o·rate 같은 음절분할 라인: 공백 거의 없고 영문만이면 발음/음절 가능성 큼
+    const noSpaces = t.replace(/\s+/g,'');
+    if (/^[A-Za-z·‧-]+$/.test(noSpaces) && noSpaces.length >= 6) return true;
+  }
+  // 품사/발음 혼합 라인에서 의미가 거의 없고 영문/기호 비중이 높으면 제외
+  const kr = koreanRatio(t);
+  if (kr < 0.1 && /[A-Za-z]/.test(t) && /[,;:/·‧\[\]\/]/.test(t)) return true;
+  return false;
+}
 
-      // 의미 조건
-      const isKoreanMeaning = korRatio(text) > 0.3 && !/[A-Za-z]{3,}/.test(text);
+function cleanMeaning(s){
+  let t = (s||'').trim();
+  // 머리번호/불릿 제거
+  t = t.replace(/^\s*(\d+\.|[①-⑳]|[-–—·‧•])\s*/,'');
+  // 중복 공백
+  t = t.replace(/\s{2,}/g,' ').trim();
+  return t;
+}
 
-      if(!isKoreanMeaning) continue;
+/* ===================== 메인 ===================== */
+async function run(){
+  const f = document.getElementById('file').files[0];
+  if(!f){ alert('이미지를 선택하세요'); return; }
 
-      // 거리 점수(가까울수록 높음)
-      const dy = cand.y - hw.y;
-      const distScore = Math.max(0, (300 - dy)) / 300;
+  const status = document.getElementById('status');
+  const out = document.getElementById('output');
+  out.innerHTML = '';
+  status.textContent = '이미지 전처리 중...';
 
-      // 텍스트 의미 점수
-      const textScore = korRatio(text);
+  const canvas = await fileToCanvas(f);
 
-      // 총 점수: 거리 + 한국어 비율
-      const score = distScore*0.5 + textScore*0.5;
+  status.textContent = 'OCR 중...(첫 실행은 다소 오래 걸릴 수 있어요)';
 
+  // Tesseract.js: 라인 단위 결과 사용 (한글 한 글자씩 끊김 완화)
+  const result = await Tesseract.recognize(canvas, 'eng+kor', {
+    logger: m => { if(m.status) status.textContent = m.status; },
+    // config 문자열: 공백으로 이어붙임
+    //  - preserve_interword_spaces: 단어 간 공백 보존
+    //  - psm 6: 단락 내 단일 균일한 블럭 가정 (교재 페이지에 적합)
+    //  - 발음/IPA에 자주 쓰이는 문자 블랙리스트
+    config: [
+      '-c preserve_interword_spaces=1',
+      '--psm 6',
+      '-c tessedit_char_blacklist=ˈˌ/[]‧·͡ːˑɪɐæʊəɛɜʒθðɔɒɑ'
+    ].join(' ')
+  });
+
+  const lines = (result.data.lines || []).map(ln => ({
+    text: (ln.text||'').replace(/\s+$/,''),
+    x0: ln.bbox.x0, y0: ln.bbox.y0, x1: ln.bbox.x1, y1: ln.bbox.y1,
+    h:  ln.bbox.y1 - ln.bbox.y0,
+    conf: ln.confidence ?? 0
+  })).filter(ln => ln.text && ln.conf > 40); // 너무 낮은 신뢰도 제거
+
+  if(lines.length === 0){
+    out.textContent = '❌ 인식된 텍스트가 없습니다. 사진을 더 밝고 크게 찍어보세요.';
+    status.textContent = '완료(데이터 없음)';
+    return;
+  }
+
+  // 통계
+  const avgH = lines.reduce((s,l)=>s+l.h,0) / lines.length;
+  const pageW = Math.max(...lines.map(l=>l.x1));
+  const leftBand = pageW * 0.45; // 좌측 단어 칼럼 대략
+
+  // 1) 헤드워드(단어) 후보: 왼쪽, 크고, 영어형, 발음라인 제외
+  const heads = lines
+    .filter(l => l.x0 < leftBand && l.h > avgH * 1.10 && isEnglishWord(l.text) && !looksLikePronunciation(l.text))
+    .sort((a,b)=>a.y0 - b.y0);
+
+  // 2) 각 헤드워드 아래에서 발음/예문 제외 후 "뜻" 찾기 (좌표 + 한글비율)
+  const pairs = [];
+  for(let i=0;i<heads.length;i++){
+    const hw = heads[i];
+    const nextY = (i+1 < heads.length) ? heads[i+1].y0 : Infinity;
+
+    // 헤드워드와 다음 헤드워드 사이 상단 영역에서 후보 라인 추출
+    const block = lines
+      .filter(l => l.y0 > hw.y0 && l.y0 < nextY)
+      .sort((a,b)=>a.y0 - b.y0);
+
+    // 후보 중 발음/IPA/음절 라인 제외 + 한글 비율 높은 줄 우선
+    const cands = block.filter(l => {
+      if(looksLikePronunciation(l.text)) return false;
+      // 영어 예문/파생어 라인 제거(영문 덩어리 많은 줄)
+      if(/[A-Za-z]{3,}/.test(l.text) && koreanRatio(l.text) < 0.3) return false;
+      return koreanRatio(l.text) >= 0.45;
+    });
+
+    // 점수: (헤드워드와의 수직거리 근접성) + (한글 비율)
+    let best = null, bestScore = -1;
+    for(const ln of cands){
+      const dy = ln.y0 - hw.y0;
+      const distScore = Math.max(0, (avgH*6 - Math.abs(dy))) / (avgH*6);
+      const kr = koreanRatio(ln.text);
+      const score = distScore*0.5 + kr*0.5;
       if(score > bestScore){
         bestScore = score;
-        best = cand;
+        best = ln;
       }
     }
 
     if(best){
-      results.push({
-        word: hw.text.toLowerCase(),
-        meaning: best.text.replace(/^(\d+\.|\·|\-)\s*/,"")
-      });
+      const word = firstToken(hw.text).toLowerCase();
+      const meaning = cleanMeaning(best.text);
+      if(meaning && meaning.length >= 2){
+        pairs.push({ word, meaning });
+      }
     }
   }
 
-  // 중복 제거
-  const uniq = Array.from(new Map(results.map(v=>[v.word,v])).values());
+  // 3) 중복 제거 (긴 의미 우선)
+  const merged = new Map();
+  for(const p of pairs){
+    if(!merged.has(p.word) || (p.meaning||'').length > (merged.get(p.word)||'').length){
+      merged.set(p.word, p.meaning);
+    }
+  }
+  const final = Array.from(merged, ([word, meaning]) => ({word, meaning}));
 
-  // 출력
-  let out="";
-  uniq.forEach(v=>{
-    out+=`<div class="word">${v.word}</div><div class="mean">${v.meaning}</div>`;
-  });
+  // 4) 출력
+  if(final.length === 0){
+    out.textContent = '❌ 단어/뜻을 찾지 못했습니다. (발음/예문은 제외했습니다)';
+  }else{
+    out.innerHTML = final.map(v => `
+      <div class="word">${v.word}</div>
+      <div class="mean">${v.meaning}</div>
+    `).join('');
+  }
 
-  document.getElementById("output").innerHTML = out || "❌ 단어 없음";
-  document.getElementById("log").innerText="✅ 완료";
-
-  if(uniq.length>0){
-    const btn=document.getElementById("saveBtn");
-    btn.style.display="inline-block";
-    btn.onclick = ()=>{
-      let csv="word,meaning\n";
-      uniq.forEach(v=>csv+=`${v.word},"${v.meaning}"\n`);
-      const blob=new Blob([csv],{type:"text/csv"});
-      const a=document.createElement("a");
-      a.href=URL.createObjectURL(blob);
-      a.download="vocab.csv";
+  // 5) 저장 버튼
+  const saveBtn = document.getElementById('saveBtn');
+  if(final.length){
+    saveBtn.style.display = 'inline-block';
+    saveBtn.onclick = () => {
+      let csv = 'word,meaning\n';
+      final.forEach(v => {
+        const safe = (v.meaning||'').replace(/"/g,'""');
+        csv += `${v.word},"${safe}"\n`;
+      });
+      const blob = new Blob([csv], {type:'text/csv'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'vocab.csv';
       a.click();
     };
+  }else{
+    saveBtn.style.display = 'none';
   }
-}
-</script>
 
+  status.textContent = '✅ 완료 (발음 제외)';
+}
+
+document.getElementById('runBtn').addEventListener('click', run);
+</script>
 </body>
 </html>
